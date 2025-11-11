@@ -16,9 +16,9 @@ class Settings(BaseSettings):
     debug: bool = True
     
     # Database Render (Source)
-    render_db_url: str = "jdbc:postgresql://dpg-d48sg3ogjchc73f2ksc0-a.oregon-postgres.render.com:5432/gestorapi_ixn4"
+    render_db_url: str = "jdbc:postgresql://dpg-d49a9fk9c44c73bilt60-a.oregon-postgres.render.com:5432/gestorapi_ij3r"
     render_db_user: str = "admin"
-    render_db_password: str = ""
+    render_db_password: str = "GimjVfMKs8ca2LSryY24otdIMJWl38W2"
     
     # Database Supabase (Target - Analytics)
     supabase_db_url: str = "postgresql://postgres.upwpqtcqhunaewddqaxl:analiticaIA@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
