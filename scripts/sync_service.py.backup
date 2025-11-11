@@ -1,0 +1,496 @@
+"""
+Servicio de sincronización automática Render → Supabase
+Sincroniza cada 2 minutos y detecta cambios automáticamente
+"""
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from loguru import logger
+import time
+import sys
+from datetime import datetime
+from typing import List, Dict, Set
+import schedule
+
+# Configuración de bases de datos
+RENDER_CONFIG = {
+    'host': 'dpg-d48sg3ogjchc73f2ksc0-a.oregon-postgres.render.com',
+    'port': 5432,
+    'database': 'gestorapi_ixn4',
+    'user': 'admin',
+    'password': 'cNi4bxZsyBvD6P2SKnP1A9iJZTWORB5p'
+}
+
+SUPABASE_CONFIG = {
+    'host': 'aws-1-us-east-1.pooler.supabase.com',
+    'port': 6543,
+    'database': 'postgres',
+    'user': 'postgres.upwpqtcqhunaewddqaxl',
+    'password': 'analiticaIA'
+}
+
+# Intervalo de sincronización en segundos (2 minutos)
+SYNC_INTERVAL = 120  # 2 minutos
+
+# Estadísticas de sincronización
+sync_stats = {
+    'total_syncs': 0,
+    'successful_syncs': 0,
+    'failed_syncs': 0,
+    'last_sync': None,
+    'records_synced': 0
+}
+
+
+class DatabaseConnection:
+    """Gestión de conexiones con reconexión automática"""
+    
+    def __init__(self, config, name):
+        self.config = config
+        self.name = name
+        self.conn = None
+        self.connect()
+    
+    def connect(self):
+        """Conectar a la base de datos"""
+        try:
+            self.conn = psycopg2.connect(**self.config)
+            logger.info(f"✅ Conectado a {self.name}")
+        except Exception as e:
+            logger.error(f"❌ Error conectando a {self.name}: {e}")
+            self.conn = None
+    
+    def reconnect(self):
+        """Reconectar si la conexión se perdió"""
+        if self.conn is None or self.conn.closed:
+            logger.warning(f"🔄 Reconectando a {self.name}...")
+            self.connect()
+    
+    def get_cursor(self, dict_cursor=False):
+        """Obtener cursor con reconexión automática"""
+        self.reconnect()
+        if dict_cursor:
+            return self.conn.cursor(cursor_factory=RealDictCursor)
+        return self.conn.cursor()
+    
+    def commit(self):
+        """Commit con manejo de errores"""
+        if self.conn:
+            self.conn.commit()
+    
+    def rollback(self):
+        """Rollback con manejo de errores"""
+        if self.conn:
+            self.conn.rollback()
+    
+    def close(self):
+        """Cerrar conexión"""
+        if self.conn:
+            self.conn.close()
+            logger.info(f"👋 Conexión cerrada a {self.name}")
+
+
+def get_all_tables(db_conn: DatabaseConnection) -> List[str]:
+    """Obtener todas las tablas de la base de datos"""
+    cursor = db_conn.get_cursor()
+    cursor.execute("""
+        SELECT table_name 
+        FROM information_schema.tables 
+        WHERE table_schema = 'public' 
+        AND table_type = 'BASE TABLE'
+        ORDER BY table_name
+    """)
+    tables = [row[0] for row in cursor.fetchall()]
+    return tables
+
+
+def get_table_schema(db_conn: DatabaseConnection, table_name: str) -> Dict:
+    """Obtener el schema de una tabla"""
+    cursor = db_conn.get_cursor(dict_cursor=True)
+    cursor.execute(f"""
+        SELECT 
+            column_name, 
+            data_type, 
+            character_maximum_length,
+            is_nullable,
+            column_default
+        FROM information_schema.columns 
+        WHERE table_name = '{table_name}'
+        ORDER BY ordinal_position
+    """)
+    return cursor.fetchall()
+
+
+def create_table_in_supabase(supabase_conn: DatabaseConnection, table_name: str, schema: List[Dict]):
+    """Crear una tabla nueva en Supabase basándose en el schema de Render"""
+    logger.info(f"📋 Creando tabla nueva: {table_name}")
+    
+    # Construir el SQL CREATE TABLE
+    columns = []
+    for col in schema:
+        col_name = col['column_name']
+        data_type = col['data_type']
+        
+        # Mapear tipos de datos
+        if data_type == 'character varying':
+            max_length = col['character_maximum_length'] or 255
+            col_type = f"VARCHAR({max_length})"
+        elif data_type == 'integer':
+            col_type = "INTEGER"
+        elif data_type == 'bigint':
+            col_type = "BIGINT"
+        elif data_type == 'numeric':
+            col_type = "NUMERIC"
+        else:
+            logger.error(f"Error en pg_dump para {table_name}: {result.stderr}")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error obteniendo DDL de {table_name}: {str(e)}")
+        return None
+
+
+def create_table_from_render(render_conn, supabase_conn, table_name: str):
+    """Crea una tabla en Supabase con la estructura EXACTA de Render"""
+    try:
+        logger.info(f"📋 Obteniendo estructura de tabla: {table_name}")
+        
+        # Obtener DDL completo desde Render
+        ddl = get_table_ddl(render_conn, table_name)
+        
+        if not ddl:
+            logger.warning(f"⚠️  No se pudo obtener DDL para {table_name}")
+            return False
+        
+        # Limpiar el DDL (remover sentencias que puedan causar problemas)
+        ddl_lines = []
+        for line in ddl.split('\n'):
+            # Omitir comentarios y líneas vacías
+            if line.strip() and not line.strip().startswith('--'):
+                # Omitir SET statements
+                if not line.strip().startswith('SET '):
+                    ddl_lines.append(line)
+        
+        clean_ddl = '\n'.join(ddl_lines)
+        
+        # Ejecutar en Supabase
+        supabase_cursor = supabase_conn.cursor()
+        
+        # Ejecutar el DDL completo
+        supabase_cursor.execute(clean_ddl)
+        supabase_conn.commit()
+        supabase_cursor.close()
+        
+        logger.info(f"✅ Tabla {table_name} creada con estructura completa")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error creando tabla {table_name}: {str(e)}")
+        supabase_conn.rollback()
+        return False
+
+
+def sync_table_data(render_conn, supabase_conn, table_name: str, full_sync: bool = False) -> int:
+    """Sincroniza los datos de una tabla específica
+    
+    Args:
+        render_conn: Conexión a Render
+        supabase_conn: Conexión a Supabase
+        table_name: Nombre de la tabla
+        full_sync: Si es True, copia TODOS los registros (migración completa)
+    """
+    try:
+        render_cursor = render_conn.cursor()
+        supabase_cursor = supabase_conn.cursor()
+        
+        # Obtener TODOS los registros desde Render
+        render_cursor.execute(f"SELECT * FROM {table_name}")
+        rows = render_cursor.fetchall()
+        
+        if not rows:
+            logger.info(f"  📦 {table_name}: Sin datos")
+            return 0
+        
+        # Obtener nombres de columnas
+        column_names = [desc[0] for desc in render_cursor.description]
+        
+        # Si es sincronización completa, primero vaciar la tabla en Supabase
+        if full_sync:
+            try:
+                supabase_cursor.execute(f"TRUNCATE TABLE {table_name} CASCADE")
+                logger.info(f"  🗑️  Tabla {table_name} vaciada para sincronización completa")
+            except:
+                pass  # La tabla puede no existir aún
+        
+        # Preparar query de inserción
+        placeholders = ', '.join(['%s'] * len(column_names))
+        columns_str = ', '.join(column_names)
+        
+        # Obtener la primary key de la tabla
+        supabase_cursor.execute(f"""
+            SELECT a.attname
+            FROM pg_index i
+            JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            WHERE i.indrelid = '{table_name}'::regclass AND i.indisprimary;
+        """)
+        pk_result = supabase_cursor.fetchone()
+        
+        if pk_result:
+            pk_column = pk_result[0]
+            # UPSERT (INSERT con ON CONFLICT)
+            update_columns = [f"{col} = EXCLUDED.{col}" for col in column_names if col != pk_column]
+            update_str = ', '.join(update_columns) if update_columns else f"{column_names[1]} = EXCLUDED.{column_names[1]}"
+            
+            upsert_query = f"""
+                INSERT INTO {table_name} ({columns_str})
+                VALUES ({placeholders})
+                ON CONFLICT ({pk_column})
+                DO UPDATE SET {update_str}
+            """
+        else:
+            # Si no hay PK, solo INSERT
+            upsert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+        
+        # Insertar/actualizar registros en batch
+        count = 0
+        batch_size = 100
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            try:
+                for row in batch:
+                    supabase_cursor.execute(upsert_query, row)
+                    count += 1
+                supabase_conn.commit()
+            except Exception as e:
+                logger.warning(f"⚠️  Error en batch de {table_name}: {str(e)}")
+                supabase_conn.rollback()
+                # Intentar uno por uno
+                for row in batch:
+                    try:
+                        supabase_cursor.execute(upsert_query, row)
+                        supabase_conn.commit()
+                        count += 1
+                    except:
+                        continue
+        
+        render_cursor.close()
+        supabase_cursor.close()
+        
+        logger.info(f"  📦 {table_name}: {count}/{len(rows)} registros sincronizados")
+        return count
+        
+    except Exception as e:
+        logger.error(f"❌ Error sincronizando {table_name}: {str(e)}")
+        supabase_conn.rollback()
+        return 0
+
+
+def sync_table_incremental(render_conn: DatabaseConnection, supabase_conn: DatabaseConnection, 
+                           table_name: str, last_sync_time: datetime = None):
+    """Sincronizar solo los cambios nuevos de una tabla"""
+    
+    render_cursor = render_conn.get_cursor(dict_cursor=True)
+    supabase_cursor = supabase_conn.get_cursor()
+    
+    try:
+        # Obtener columnas
+        render_cursor.execute(f"SELECT * FROM {table_name} LIMIT 0")
+        columns = [desc[0] for desc in render_cursor.description]
+        
+        # Construir query con filtro de tiempo si existe columna de timestamp
+        time_filter = ""
+        if last_sync_time and any(col in columns for col in ['fecha_actualizacion', 'fecha_creacion', 'fecha_pedido', 'fecha_movimiento']):
+            time_col = next((col for col in ['fecha_actualizacion', 'fecha_creacion', 'fecha_pedido', 'fecha_movimiento'] if col in columns), None)
+            if time_col:
+                time_filter = f" WHERE {time_col} > '{last_sync_time.strftime('%Y-%m-%d %H:%M:%S')}'"
+        
+        # Obtener registros nuevos/modificados
+        query = f"SELECT * FROM {table_name}{time_filter}"
+        render_cursor.execute(query)
+        rows = render_cursor.fetchall()
+        
+        if not rows:
+            return 0
+        
+        synced_count = 0
+        
+        for row in rows:
+            values = [row[col] for col in columns]
+            
+            # Verificar si el registro ya existe (usando ID)
+            if 'id' in columns:
+                check_query = f"SELECT id FROM {table_name} WHERE id = %s"
+                supabase_cursor.execute(check_query, (row['id'],))
+                exists = supabase_cursor.fetchone()
+                
+                if exists:
+                    # UPDATE
+                    set_clause = ', '.join([f"{col} = %s" for col in columns if col != 'id'])
+                    update_values = [row[col] for col in columns if col != 'id']
+                    update_values.append(row['id'])
+                    update_query = f"UPDATE {table_name} SET {set_clause} WHERE id = %s"
+                    supabase_cursor.execute(update_query, update_values)
+                else:
+                    # INSERT
+                    placeholders = ','.join(['%s'] * len(columns))
+                    columns_str = ','.join(columns)
+                    insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders})"
+                    supabase_cursor.execute(insert_query, values)
+            else:
+                # Si no hay ID, hacer INSERT directo
+                placeholders = ','.join(['%s'] * len(columns))
+                columns_str = ','.join(columns)
+                insert_query = f"INSERT INTO {table_name} ({columns_str}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"
+                supabase_cursor.execute(insert_query, values)
+            
+            synced_count += 1
+        
+        supabase_conn.commit()
+        return synced_count
+        
+    except Exception as e:
+        logger.error(f"❌ Error sincronizando {table_name}: {e}")
+        supabase_conn.rollback()
+        return 0
+
+
+def sync_databases():
+    """Sincronización completa de bases de datos"""
+    sync_stats['total_syncs'] += 1
+    start_time = datetime.now()
+    
+    logger.info("="*70)
+    logger.info(f"🔄 Iniciando sincronización #{sync_stats['total_syncs']}")
+    logger.info(f"⏰ Hora: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*70)
+    
+    try:
+        # Conectar a ambas bases
+        render_db = DatabaseConnection(RENDER_CONFIG, "Render")
+        supabase_db = DatabaseConnection(SUPABASE_CONFIG, "Supabase")
+        
+        # Obtener tablas de Render
+        render_tables = get_all_tables(render_db)
+        supabase_tables = get_all_tables(supabase_db)
+        
+        logger.info(f"📊 Tablas en Render: {len(render_tables)}")
+        logger.info(f"📊 Tablas en Supabase: {len(supabase_tables)}")
+        
+        # Detectar nuevas tablas (primera sincronización o tablas nuevas)
+        new_tables = render_tables - supabase_tables
+        is_first_sync = len(supabase_tables) == 0
+        
+        if new_tables:
+            logger.warning(f"🆕 Nuevas tablas detectadas: {new_tables}")
+            for table in new_tables:
+                success = create_table_from_render(render_db, supabase_db, table)
+                if success:
+                    # Copiar TODOS los datos de las tablas nuevas
+                    records_synced = sync_table_data(render_db, supabase_db, table, full_sync=True)
+                    total_synced = records_synced
+        
+        # Sincronizar datos de tablas existentes (solo cambios nuevos)
+        existing_tables = render_tables - new_tables
+        for table in existing_tables:
+            records_synced = sync_table_data(render_db, supabase_db, table, full_sync=is_first_sync)
+            total_synced += records_synced
+        
+        last_sync = sync_stats.get('last_sync')
+        
+        for table in render_tables:
+            try:
+                count = sync_table_incremental(render_db, supabase_db, table, last_sync)
+                if count > 0:
+                    logger.info(f"  📦 {table}: {count} registros sincronizados")
+                    total_records += count
+            except Exception as e:
+                logger.error(f"  ❌ Error en {table}: {e}")
+        
+        # Actualizar estadísticas
+        sync_stats['successful_syncs'] += 1
+        sync_stats['last_sync'] = datetime.now()
+        sync_stats['records_synced'] += total_records
+        
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        logger.info("="*70)
+        logger.info(f"✅ Sincronización completada")
+        logger.info(f"📊 Total de registros sincronizados: {total_records}")
+        logger.info(f"⏱️  Duración: {duration:.2f} segundos")
+        logger.info(f"📈 Sincronizaciones exitosas: {sync_stats['successful_syncs']}/{sync_stats['total_syncs']}")
+        logger.info("="*70)
+        
+        # Cerrar conexiones
+        render_db.close()
+        supabase_db.close()
+        
+    except Exception as e:
+        sync_stats['failed_syncs'] += 1
+        logger.error(f"❌ Error en sincronización: {e}")
+
+
+def print_stats():
+    """Imprimir estadísticas del servicio"""
+    logger.info("\n" + "="*70)
+    logger.info("📊 ESTADÍSTICAS DEL SERVICIO DE SINCRONIZACIÓN")
+    logger.info("="*70)
+    logger.info(f"🔢 Total de sincronizaciones: {sync_stats['total_syncs']}")
+    logger.info(f"✅ Exitosas: {sync_stats['successful_syncs']}")
+    logger.info(f"❌ Fallidas: {sync_stats['failed_syncs']}")
+    logger.info(f"📦 Total de registros sincronizados: {sync_stats['records_synced']}")
+    if sync_stats['last_sync']:
+        logger.info(f"⏰ Última sincronización: {sync_stats['last_sync'].strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*70 + "\n")
+
+
+def run_sync_service():
+    """Ejecutar el servicio de sincronización continua"""
+    logger.info("="*70)
+    logger.info("🚀 SERVICIO DE SINCRONIZACIÓN AUTOMÁTICA")
+    logger.info("="*70)
+    logger.info(f"🔄 Intervalo: {SYNC_INTERVAL} segundos ({SYNC_INTERVAL/60:.1f} minutos)")
+    logger.info(f"📡 Render → Supabase")
+    logger.info(f"🕐 Inicio: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info("="*70)
+    logger.info("💡 Presiona Ctrl+C para detener el servicio")
+    logger.info("="*70 + "\n")
+    
+    # Sincronización inicial
+    sync_databases()
+    
+    # Programar sincronizaciones cada 2 minutos
+    schedule.every(SYNC_INTERVAL).seconds.do(sync_databases)
+    
+    # Programar impresión de estadísticas cada 10 minutos
+    schedule.every(10).minutes.do(print_stats)
+    
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("\n" + "="*70)
+        logger.info("🛑 Deteniendo servicio de sincronización...")
+        print_stats()
+        logger.info("👋 Servicio detenido correctamente")
+        logger.info("="*70)
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    # Configurar logger
+    logger.remove()
+    logger.add(
+        sys.stdout,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>",
+        level="INFO"
+    )
+    logger.add(
+        "logs/sync_service.log",
+        rotation="1 day",
+        retention="7 days",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
+        level="INFO"
+    )
+    
+    run_sync_service()

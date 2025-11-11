@@ -1,0 +1,85 @@
+services:
+  # ===================================
+  # SERVICIO ANALITICAIA - API REST
+  # ===================================
+  analiticaia-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: analiticaia-api
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "python scripts/wait_for_db.py && 
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    environment:
+      # Application
+      - APP_NAME=AnaliticaIA
+      - APP_VERSION=1.0.0
+      - APP_HOST=0.0.0.0
+      - APP_PORT=8000
+      - DEBUG=True
+      
+      # Supabase Database
+      - SUPABASE_DB_URL=postgresql://postgres.upwpqtcqhunaewddqaxl:analiticaIA@aws-1-us-east-1.pooler.supabase.com:6543/postgres
+      - SUPABASE_DB_USER=postgres.upwpqtcqhunaewddqaxl
+      - SUPABASE_DB_PASSWORD=analiticaIA
+      - SUPABASE_DB_HOST=aws-1-us-east-1.pooler.supabase.com
+      - SUPABASE_DB_PORT=6543
+      - SUPABASE_DB_NAME=postgres
+      
+      # Machine Learning
+      - ML_MODEL_PATH=/app/models
+      - ML_RETRAIN_INTERVAL=86400
+    
+    volumes:
+      - ./app:/app/app
+      - ./models:/app/models
+      - ./scripts:/app/scripts
+    
+    networks:
+      - analitica-network
+    
+    restart: unless-stopped
+    
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ===================================
+  # SERVICIO DE SINCRONIZACIÓN AUTOMÁTICA
+  # Sincroniza Render → Supabase cada 2 minutos
+  # ===================================
+  analiticaia-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: analiticaia-sync
+    command: python scripts/sync_service.py
+    environment:
+      # Sync Configuration
+      - SYNC_INTERVAL=120
+      - LOG_LEVEL=INFO
+      - PYTHONUNBUFFERED=1
+    
+    volumes:
+      - ./scripts:/app/scripts
+      - ./logs:/app/logs
+    
+    networks:
+      - analitica-network
+    
+    restart: unless-stopped
+
+networks:
+  analitica-network:
+    driver: bridge
+
+volumes:
+  models-data:
+    driver: local
+  logs-data:
+    driver: local
